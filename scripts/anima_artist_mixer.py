@@ -473,24 +473,33 @@ def _combine_concat_masks(
 
 def _resolve_mask(
     cond_or_uncond: list[int] | tuple[int, ...] | None,
-    batch_size: int,
+    row_count: int,
     apply_to_uncond: bool,
     state: dict[str, Any],
 ) -> list[bool]:
-    if cond_or_uncond is None or len(cond_or_uncond) != batch_size:
+    markers = list(cond_or_uncond or [])
+    if markers and len(markers) != row_count and row_count % len(markers) == 0:
+        rows_per_chunk = row_count // len(markers)
+        markers = [
+            marker
+            for marker in markers
+            for _ in range(rows_per_chunk)
+        ]
+
+    if not markers or len(markers) != row_count:
         if not state.get("_warned_mask", False):
             logger.warning(
                 "[AnimaArtistMixer] cond_or_uncond is unavailable (got=%s, batch=%d); applying to all rows.",
                 cond_or_uncond,
-                batch_size,
+                row_count,
             )
             state["_warned_mask"] = True
-        return [True] * batch_size
+        return [True] * row_count
 
     if apply_to_uncond:
-        return [True] * batch_size
+        return [True] * row_count
 
-    return [marker == 0 for marker in cond_or_uncond]
+    return [marker == 0 for marker in markers]
 
 
 def _in_sigma_range(state: dict[str, Any]) -> bool:
