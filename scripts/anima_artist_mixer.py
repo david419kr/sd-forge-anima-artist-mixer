@@ -438,6 +438,141 @@ def _with_negpip_mask(
     return next_options
 
 
+def _callable_func(callable_obj: Any) -> Any:
+    return getattr(callable_obj, "__func__", callable_obj)
+
+
+def _closure_map(func: Any) -> dict[str, Any]:
+    code = getattr(func, "__code__", None)
+    closure = getattr(func, "__closure__", None)
+    if code is None or closure is None:
+        return {}
+    return {
+        name: cell.cell_contents
+        for name, cell in zip(code.co_freevars, closure)
+    }
+
+
+def _extract_forge_couple_state(attn_module: nn.Module) -> dict[str, Any] | None:
+    forward = _callable_func(getattr(attn_module, "forward", None))
+    if forward is None or not getattr(forward, "_couple", False):
+        return None
+
+    state = _closure_map(forward)
+    inner = state.get("func")
+    if callable(inner):
+        inner_state = _closure_map(inner)
+        if "mask" in inner_state and "num_conds" in inner_state:
+            state = inner_state
+
+    required = {"mask", "num_conds", "width", "height", "dit"}
+    if not required.issubset(state):
+        return None
+
+    original_forward = getattr(attn_module, "couple_orig_forward", None)
+    if original_forward is None:
+        return None
+
+    state["original_forward"] = original_forward
+    return state
+
+
+def _forge_couple_artist_forward(
+    attn_module: nn.Module,
+    x: torch.Tensor,
+    context: torch.Tensor,
+    rope_emb: torch.Tensor | None,
+    transformer_options: dict[str, Any],
+) -> torch.Tensor | None:
+    state = _extract_forge_couple_state(attn_module)
+    cond_or_unconds = transformer_options.get("cond_or_uncond") if transformer_options else None
+    if state is None or context is None or not cond_or_unconds:
+        return None
+
+    num_chunks = len(cond_or_unconds)
+    if num_chunks <= 0 or x.shape[0] % num_chunks != 0:
+        return None
+
+    batch_size = x.shape[0] // num_chunks
+    context_3d = context.squeeze(1) if context.dim() == 4 and context.shape[1] == 1 else context
+    if context_3d.dim() != 3 or context_3d.shape[0] != x.shape[0]:
+        return None
+
+    try:
+        from lib_couple.attention_masks import get_dit_mask
+    except Exception:
+        return None
+
+    original_forward = state["original_forward"]
+    num_conds = int(state["num_conds"])
+    mask = state["mask"].to(device=x.device, dtype=x.dtype)
+    dit = state["dit"]
+    width = int(state["width"])
+    height = int(state["height"])
+
+    x_chunks = x.chunk(num_chunks, dim=0)
+
+    if context_3d.shape[-2] < 512:
+        context_3d = torch.nn.functional.pad(context_3d, (0, 0, 0, 512 - context_3d.shape[-2]))
+    elif context_3d.shape[-2] % 512 != 0:
+        target_tokens = ((context_3d.shape[-2] + 511) // 512) * 512
+        context_3d = torch.nn.functional.pad(context_3d, (0, 0, 0, target_tokens - context_3d.shape[-2]))
+
+    context_chunks = context_3d.chunk(num_chunks, dim=0)
+
+    negpip_mask = _mask_from_options(transformer_options, context_3d)
+    negpip_chunks = negpip_mask.chunk(num_chunks, dim=0) if negpip_mask is not None else None
+
+    new_x = []
+    new_context = []
+    new_negpip_masks = []
+
+    for idx, cond_or_uncond in enumerate(cond_or_unconds):
+        c_target = context_chunks[idx]
+        if cond_or_uncond == 1:
+            new_x.append(x_chunks[idx])
+            new_context.append(c_target)
+            if negpip_chunks is not None:
+                new_negpip_masks.append(negpip_chunks[idx])
+        else:
+            new_x.append(x_chunks[idx].repeat(num_conds, *([1] * (x.dim() - 1))))
+            new_context.append(c_target.repeat(num_conds, *([1] * (c_target.dim() - 1))))
+            if negpip_chunks is not None:
+                new_negpip_masks.append(negpip_chunks[idx].repeat(num_conds, *([1] * (negpip_chunks[idx].dim() - 1))))
+
+    x_in = torch.cat(new_x, dim=0)
+    ctx_in = torch.cat(new_context, dim=0).to(dtype=x_in.dtype)
+
+    next_options = dict(transformer_options)
+    if new_negpip_masks:
+        next_options["negpip_mask"] = torch.cat(new_negpip_masks, dim=0).to(device=ctx_in.device, dtype=ctx_in.dtype)
+
+    out = original_forward(
+        x_in,
+        context=ctx_in,
+        rope_emb=rope_emb,
+        transformer_options=next_options,
+    )
+
+    seq_len = int(out.shape[1])
+    patch_size = int(getattr(dit, "patch_spatial", 2))
+    mask_downsample = get_dit_mask(mask, seq_len, width, height, patch_size=patch_size).to(out)
+
+    outputs = []
+    pos = 0
+    for cond_or_uncond in cond_or_unconds:
+        if cond_or_uncond == 1:
+            outputs.append(out[pos : pos + batch_size])
+            pos += batch_size
+        else:
+            chunk = out[pos : pos + num_conds * batch_size]
+            chunk = chunk.view(num_conds, batch_size, seq_len, -1)
+            outputs.append((chunk * mask_downsample).sum(dim=0))
+            pos += num_conds * batch_size
+
+    return torch.cat(outputs, dim=0)
+
+
 def _broadcast_batch(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
     if tensor.shape[0] == batch_size:
         return tensor
@@ -522,6 +657,33 @@ class _CrossAttnWrapper(nn.Module):
         self._state = shared_state
         self._layer_idx = layer_idx
         self._disabled = False
+
+    def _call_original(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        rope_emb: torch.Tensor | None,
+        transformer_options: dict[str, Any],
+        *,
+        forge_couple_artist: bool = False,
+    ) -> torch.Tensor:
+        if forge_couple_artist:
+            couple_out = _forge_couple_artist_forward(
+                self.original,
+                x,
+                context,
+                rope_emb,
+                transformer_options,
+            )
+            if couple_out is not None:
+                return couple_out
+
+        return self.original(
+            x,
+            context,
+            rope_emb=rope_emb,
+            transformer_options=transformer_options,
+        )
 
     def forward(
         self,
@@ -675,11 +837,12 @@ class _CrossAttnWrapper(nn.Module):
                     kv = artist_b
                     kv_mask = artist_mask_b
 
-                out_i = self.original(
+                out_i = self._call_original(
                     x,
                     kv,
-                    rope_emb=rope_emb,
-                    transformer_options=_with_negpip_mask(transformer_options, kv_mask),
+                    rope_emb,
+                    _with_negpip_mask(transformer_options, kv_mask),
+                    forge_couple_artist=True,
                 )
                 artist_total = out_i * weight if artist_total is None else artist_total + out_i * weight
 
@@ -753,11 +916,12 @@ class _CrossAttnWrapper(nn.Module):
         if cond_or_uncond is not None:
             next_options["cond_or_uncond"] = list(cond_or_uncond) * artist_count
 
-        out = self.original(
+        out = self._call_original(
             x_rep,
             kv_stacked,
-            rope_emb=rope_rep,
-            transformer_options=next_options,
+            rope_rep,
+            next_options,
+            forge_couple_artist=True,
         )
         out = out.view(artist_count, batch_size, *out.shape[1:])
         weight_tensor = torch.tensor(weights, device=out.device, dtype=out.dtype).view(
@@ -789,11 +953,12 @@ class _CrossAttnWrapper(nn.Module):
                 rope_emb=rope_emb,
                 transformer_options=transformer_options,
             )
-            artist_out = self.original(
+            artist_out = self._call_original(
                 x,
                 artist_b,
-                rope_emb=rope_emb,
-                transformer_options=_with_negpip_mask(transformer_options, artist_mask_b),
+                rope_emb,
+                _with_negpip_mask(transformer_options, artist_mask_b),
+                forge_couple_artist=True,
             )
             out = base_out.clone()
             for row, hit in enumerate(mask):
@@ -814,11 +979,12 @@ class _CrossAttnWrapper(nn.Module):
         merged = _cat_context(context, extension)
         base_mask = _mask_or_ones(_mask_from_options(transformer_options, context), context)
         merged_mask = _cat_context(base_mask, extension_mask)
-        return self.original(
+        return self._call_original(
             x,
             merged,
-            rope_emb=rope_emb,
-            transformer_options=_with_negpip_mask(transformer_options, merged_mask),
+            rope_emb,
+            _with_negpip_mask(transformer_options, merged_mask),
+            forge_couple_artist=True,
         )
 
 
