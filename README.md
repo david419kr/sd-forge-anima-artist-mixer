@@ -49,6 +49,9 @@ Weighted example:
 
 Artist entries are separated by commas.
 
+<img width="799" height="311" alt="image" src="https://github.com/user-attachments/assets/ee3cf6e8-84d1-458c-89d8-1e3f7c5ec452" />
+
+
 ## Artist Chain Box Position
 
 By default, the **Artist Chain** box appears between the positive prompt and negative prompt.
@@ -70,6 +73,8 @@ Changing this setting requires reloading the UI.
 ## AnimaArtistCrossAttn Panel
 
 The **AnimaArtistCrossAttn** panel contains optional controls.
+
+<img width="541" height="397" alt="image" src="https://github.com/user-attachments/assets/d6147586-e789-49a6-bd91-5a5067e7c4f8" />
 
 The extension is always available. There is no ON/OFF switch. It only activates when the **Artist Chain** box contains at least one valid artist/style tag.
 
