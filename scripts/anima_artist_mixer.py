@@ -297,11 +297,18 @@ def _validate_diffusion_model(diffusion_model: nn.Module) -> tuple[bool, int, st
     return True, len(blocks), "ok"
 
 
-def _as_tensor(conditioning: Any) -> torch.Tensor | None:
+def _as_tensor(
+    conditioning: Any,
+    keys: tuple[str, ...] = ("crossattn", "cross_attn"),
+) -> torch.Tensor | None:
     if torch.is_tensor(conditioning):
         return conditioning
     if isinstance(conditioning, dict):
-        value = conditioning.get("crossattn", conditioning.get("cross_attn"))
+        value = None
+        for key in keys:
+            value = conditioning.get(key)
+            if value is not None:
+                break
         return value if torch.is_tensor(value) else None
     return None
 
@@ -322,9 +329,13 @@ def _pad_sequence_tensor(tensor: torch.Tensor, target_tokens: int) -> torch.Tens
     return torch.cat([tensor, tail], dim=-2)
 
 
-def _conditioning_to_batch_tensor(conditioning: Any, expected_batch: int) -> torch.Tensor | None:
+def _conditioning_to_batch_tensor(
+    conditioning: Any,
+    expected_batch: int,
+    keys: tuple[str, ...] = ("crossattn", "cross_attn"),
+) -> torch.Tensor | None:
     if isinstance(conditioning, (list, tuple)):
-        items = [_as_tensor(item) for item in conditioning]
+        items = [_as_tensor(item, keys) for item in conditioning]
         items = [item for item in items if item is not None]
         if not items:
             return None
@@ -337,7 +348,7 @@ def _conditioning_to_batch_tensor(conditioning: Any, expected_batch: int) -> tor
             stacked = stacked.squeeze(1)
         return stacked
 
-    tensor = _as_tensor(conditioning)
+    tensor = _as_tensor(conditioning, keys)
     if tensor is None:
         return None
 
@@ -365,6 +376,68 @@ def _match_context_rank(artist: torch.Tensor, context: torch.Tensor) -> torch.Te
     return result
 
 
+def _fit_token_length(
+    tensor: torch.Tensor,
+    token_length: int,
+    pad_value: float = 1.0,
+) -> torch.Tensor:
+    if tensor.shape[-2] == token_length:
+        return tensor
+    if tensor.shape[-2] > token_length:
+        return tensor[..., :token_length, :]
+
+    pad_shape = (*tensor.shape[:-2], token_length - tensor.shape[-2], tensor.shape[-1])
+    padding = torch.full(pad_shape, pad_value, device=tensor.device, dtype=tensor.dtype)
+    return torch.cat([tensor, padding], dim=-2)
+
+
+def _fit_mask_to_context(mask: torch.Tensor | None, context: torch.Tensor) -> torch.Tensor | None:
+    if mask is None:
+        return None
+
+    result = mask
+    if result.dim() == 1:
+        result = result.view(1, -1, 1)
+    elif result.dim() == 2:
+        result = result.unsqueeze(0)
+
+    result = _match_context_rank(result, context)
+    result = _fit_token_length(result, context.shape[-2], pad_value=1.0)
+    result = _broadcast_batch(result, context.shape[0])
+    return result.to(device=context.device, dtype=context.dtype)
+
+
+def _ones_mask_like(context: torch.Tensor) -> torch.Tensor:
+    return torch.ones(
+        (*context.shape[:-1], 1),
+        device=context.device,
+        dtype=context.dtype,
+    )
+
+
+def _mask_or_ones(mask: torch.Tensor | None, context: torch.Tensor) -> torch.Tensor:
+    return mask if mask is not None else _ones_mask_like(context)
+
+
+def _mask_from_options(transformer_options: dict[str, Any], context: torch.Tensor) -> torch.Tensor | None:
+    mask = transformer_options.get("negpip_mask") if isinstance(transformer_options, dict) else None
+    if not torch.is_tensor(mask):
+        return None
+    return _fit_mask_to_context(mask, context)
+
+
+def _with_negpip_mask(
+    transformer_options: dict[str, Any],
+    mask: torch.Tensor | None,
+) -> dict[str, Any]:
+    next_options = dict(transformer_options)
+    if mask is None:
+        next_options.pop("negpip_mask", None)
+    else:
+        next_options["negpip_mask"] = mask
+    return next_options
+
+
 def _broadcast_batch(tensor: torch.Tensor, batch_size: int) -> torch.Tensor:
     if tensor.shape[0] == batch_size:
         return tensor
@@ -381,6 +454,20 @@ def _cat_context(left: torch.Tensor, right: torch.Tensor) -> torch.Tensor:
 
 def _combine_concat(individuals: list[torch.Tensor], weights: list[float]) -> torch.Tensor:
     parts = [artist * float(weight) for artist, weight in zip(individuals, weights)]
+    return torch.cat(parts, dim=-2)
+
+
+def _combine_concat_masks(
+    individuals: list[torch.Tensor],
+    masks: list[torch.Tensor | None],
+) -> torch.Tensor | None:
+    if not any(mask is not None for mask in masks):
+        return None
+
+    parts = [
+        mask if mask is not None else _ones_mask_like(artist)
+        for artist, mask in zip(individuals, masks)
+    ]
     return torch.cat(parts, dim=-2)
 
 
@@ -479,6 +566,13 @@ class _CrossAttnWrapper(nn.Module):
             _match_context_rank(artist, context).to(device=context.device, dtype=context.dtype)
             for artist in state["individuals"]
         ]
+        stored_masks = list(state.get("individual_masks") or [])
+        if len(stored_masks) < len(individuals):
+            stored_masks.extend([None] * (len(individuals) - len(stored_masks)))
+        individual_masks = [
+            _fit_mask_to_context(mask, artist) if mask is not None else None
+            for artist, mask in zip(individuals, stored_masks)
+        ]
         weights = state["user_weights"]
         batch_size = context.shape[0]
         cond_or_uncond = transformer_options.get("cond_or_uncond")
@@ -499,6 +593,7 @@ class _CrossAttnWrapper(nn.Module):
                 rope_emb,
                 transformer_options,
                 individuals,
+                individual_masks,
                 weights,
                 mask,
                 state["fusion_mode"],
@@ -506,12 +601,14 @@ class _CrossAttnWrapper(nn.Module):
             )
 
         combined = _combine_concat(individuals, weights)
+        combined_mask = _combine_concat_masks(individuals, individual_masks)
         return self._fwd_with_combined(
             x,
             context,
             rope_emb,
             transformer_options,
             combined,
+            combined_mask,
             mask,
             state["fusion_mode"],
             float(state["strength"]),
@@ -524,6 +621,7 @@ class _CrossAttnWrapper(nn.Module):
         rope_emb: torch.Tensor | None,
         transformer_options: dict[str, Any],
         individuals: list[torch.Tensor],
+        individual_masks: list[torch.Tensor | None],
         weights: list[float],
         mask: list[bool],
         fusion_mode: str,
@@ -541,6 +639,7 @@ class _CrossAttnWrapper(nn.Module):
                     rope_emb,
                     transformer_options,
                     individuals,
+                    individual_masks,
                     normalized_weights,
                     fusion_mode,
                 )
@@ -555,14 +654,23 @@ class _CrossAttnWrapper(nn.Module):
                 artist_total = None
 
         if artist_total is None:
-            for artist, weight in zip(individuals, normalized_weights):
+            for artist, artist_mask, weight in zip(individuals, individual_masks, normalized_weights):
                 artist_b = _broadcast_batch(artist, batch_size).to(device=context.device, dtype=context.dtype)
-                kv = _cat_context(context, artist_b) if fusion_mode == FUSION_CONCAT_WITH_BASE else artist_b
+                artist_mask_b = _fit_mask_to_context(artist_mask, artist_b)
+
+                if fusion_mode == FUSION_CONCAT_WITH_BASE:
+                    base_mask = _mask_or_ones(_mask_from_options(transformer_options, context), context)
+                    kv = _cat_context(context, artist_b)
+                    kv_mask = _cat_context(base_mask, _mask_or_ones(artist_mask_b, artist_b))
+                else:
+                    kv = artist_b
+                    kv_mask = artist_mask_b
+
                 out_i = self.original(
                     x,
                     kv,
                     rope_emb=rope_emb,
-                    transformer_options=transformer_options,
+                    transformer_options=_with_negpip_mask(transformer_options, kv_mask),
                 )
                 artist_total = out_i * weight if artist_total is None else artist_total + out_i * weight
 
@@ -588,16 +696,26 @@ class _CrossAttnWrapper(nn.Module):
         rope_emb: torch.Tensor | None,
         transformer_options: dict[str, Any],
         individuals: list[torch.Tensor],
+        individual_masks: list[torch.Tensor | None],
         weights: list[float],
         fusion_mode: str,
     ) -> torch.Tensor:
         batch_size = context.shape[0]
         artist_count = len(individuals)
         kv_list = []
+        kv_mask_list = []
+        base_mask = _mask_from_options(transformer_options, context)
 
-        for artist in individuals:
+        for artist, artist_mask in zip(individuals, individual_masks):
             artist_b = _broadcast_batch(artist, batch_size).to(device=context.device, dtype=context.dtype)
-            kv_list.append(_cat_context(context, artist_b) if fusion_mode == FUSION_CONCAT_WITH_BASE else artist_b)
+            artist_mask_b = _fit_mask_to_context(artist_mask, artist_b)
+
+            if fusion_mode == FUSION_CONCAT_WITH_BASE:
+                kv_list.append(_cat_context(context, artist_b))
+                kv_mask_list.append(_cat_context(_mask_or_ones(base_mask, context), _mask_or_ones(artist_mask_b, artist_b)))
+            else:
+                kv_list.append(artist_b)
+                kv_mask_list.append(artist_mask_b)
 
         kv_shapes = {tuple(kv.shape[1:]) for kv in kv_list}
         if len(kv_shapes) > 1:
@@ -611,6 +729,17 @@ class _CrossAttnWrapper(nn.Module):
             rope_rep = rope_emb.repeat(artist_count, *([1] * (rope_emb.dim() - 1)))
 
         next_options = dict(transformer_options)
+        if any(mask is not None for mask in kv_mask_list):
+            next_options["negpip_mask"] = torch.cat(
+                [
+                    mask if mask is not None else _ones_mask_like(kv)
+                    for kv, mask in zip(kv_list, kv_mask_list)
+                ],
+                dim=0,
+            )
+        else:
+            next_options.pop("negpip_mask", None)
+
         cond_or_uncond = next_options.get("cond_or_uncond")
         if cond_or_uncond is not None:
             next_options["cond_or_uncond"] = list(cond_or_uncond) * artist_count
@@ -635,12 +764,14 @@ class _CrossAttnWrapper(nn.Module):
         rope_emb: torch.Tensor | None,
         transformer_options: dict[str, Any],
         combined: torch.Tensor,
+        combined_mask: torch.Tensor | None,
         mask: list[bool],
         fusion_mode: str,
         strength: float,
     ) -> torch.Tensor:
         batch_size = context.shape[0]
         artist_b = _broadcast_batch(combined, batch_size).to(device=context.device, dtype=context.dtype)
+        artist_mask_b = _fit_mask_to_context(combined_mask, artist_b)
 
         if fusion_mode == FUSION_INTERPOLATE:
             base_out = self.original(
@@ -653,7 +784,7 @@ class _CrossAttnWrapper(nn.Module):
                 x,
                 artist_b,
                 rope_emb=rope_emb,
-                transformer_options=transformer_options,
+                transformer_options=_with_negpip_mask(transformer_options, artist_mask_b),
             )
             out = base_out.clone()
             for row, hit in enumerate(mask):
@@ -662,15 +793,23 @@ class _CrossAttnWrapper(nn.Module):
             return out
 
         extension = torch.zeros_like(artist_b)
+        extension_mask = _ones_mask_like(artist_b)
+        if artist_mask_b is not None:
+            extension_mask = torch.ones_like(artist_mask_b)
+
         for row, hit in enumerate(mask):
             if hit:
                 extension[row] = artist_b[row]
+                if artist_mask_b is not None:
+                    extension_mask[row] = artist_mask_b[row]
         merged = _cat_context(context, extension)
+        base_mask = _mask_or_ones(_mask_from_options(transformer_options, context), context)
+        merged_mask = _cat_context(base_mask, extension_mask)
         return self.original(
             x,
             merged,
             rope_emb=rope_emb,
-            transformer_options=transformer_options,
+            transformer_options=_with_negpip_mask(transformer_options, merged_mask),
         )
 
 
@@ -728,9 +867,10 @@ def _encode_artist_conditionings(
     sd_model: Any,
     artists: list[str],
     base_prompts: list[str],
-) -> list[torch.Tensor]:
+) -> tuple[list[torch.Tensor], list[torch.Tensor | None]]:
     expected_batch = len(base_prompts)
     individuals: list[torch.Tensor] = []
+    individual_masks: list[torch.Tensor | None] = []
 
     with torch.inference_mode():
         for artist in artists:
@@ -742,9 +882,17 @@ def _encode_artist_conditionings(
             tensor = _conditioning_to_batch_tensor(conditioning, expected_batch)
             if tensor is None:
                 raise ValueError(f"artist conditioning is empty: {artist!r}")
-            individuals.append(tensor)
 
-    return individuals
+            mask = _conditioning_to_batch_tensor(
+                conditioning,
+                expected_batch,
+                ("c_negpip_mask", "negpip_mask"),
+            )
+            mask = _fit_mask_to_context(mask, tensor) if mask is not None else None
+            individuals.append(tensor)
+            individual_masks.append(mask)
+
+    return individuals, individual_masks
 
 
 def _target_blocks(
@@ -783,6 +931,7 @@ def _sigma_range(unet: Any, start_percent: float, end_percent: float) -> tuple[f
 def _patch_unet(
     unet: Any,
     individuals: list[torch.Tensor],
+    individual_masks: list[torch.Tensor | None],
     combine_mode: str,
     fusion_mode: str,
     strength: float,
@@ -815,6 +964,7 @@ def _patch_unet(
         "apply_to_uncond": bool(apply_to_uncond),
         "normalize_weights": bool(normalize_weights),
         "individuals": individuals,
+        "individual_masks": individual_masks,
         "user_weights": [1.0] * len(individuals),
         "sigma_range": sigma_range,
         "current_sigma": None,
@@ -1041,12 +1191,13 @@ class Script(scripts.Script):
         end_percent = _clamp01(end_percent)
 
         base_prompts = _current_base_prompts(p, kwargs)
-        individuals = _encode_artist_conditionings(p.sd_model, artists, base_prompts)
+        individuals, individual_masks = _encode_artist_conditionings(p.sd_model, artists, base_prompts)
 
         unet = p.sd_model.forge_objects.unet
         patched_unet = _patch_unet(
             unet,
             individuals,
+            individual_masks,
             combine_mode,
             fusion_mode,
             float(strength),
