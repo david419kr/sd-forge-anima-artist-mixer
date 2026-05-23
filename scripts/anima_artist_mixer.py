@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-import json
 import logging
+import math
 import re
 from contextlib import nullcontext
-from pathlib import Path
 from typing import Any
 
 import gradio as gr
@@ -13,7 +12,6 @@ import torch.nn as nn
 
 import modules.scripts as scripts
 from modules import script_callbacks, shared
-from modules.ui_components import InputAccordion
 
 logger = logging.getLogger(__name__)
 
@@ -25,10 +23,6 @@ POSITION_ABOVE = "above"
 POSITION_BETWEEN = "between"
 POSITION_BELOW = "below"
 POSITION_CHOICES = [POSITION_ABOVE, POSITION_BETWEEN, POSITION_BELOW]
-
-SCRIPT_BASENAME = Path(__file__).name
-UI_KEY_TXT = f"customscript/{SCRIPT_BASENAME}/txt2img/{TITLE}/value"
-UI_KEY_IMG = f"customscript/{SCRIPT_BASENAME}/img2img/{TITLE}/value"
 
 FUSION_INTERPOLATE = "interpolate"
 FUSION_CONCAT_WITH_BASE = "concat_with_base"
@@ -160,58 +154,6 @@ def _patch_toprow() -> None:
 
 
 script_callbacks.on_before_ui(_patch_toprow)
-
-
-def _ui_config_path() -> Path:
-    return Path(shared.data_path) / "ui-config.json"
-
-
-def _read_ui_config() -> dict[str, Any]:
-    path = _ui_config_path()
-    if not path.exists():
-        return {}
-
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logger.warning("[AnimaArtistMixer] Failed to read ui-config.json: %s", exc)
-        return {}
-
-
-def _write_ui_config(config: dict[str, Any]) -> None:
-    path = _ui_config_path()
-    path.write_text(json.dumps(config, indent=4, ensure_ascii=False), encoding="utf-8")
-
-
-def _startup_keys() -> tuple[str, str]:
-    return UI_KEY_TXT, UI_KEY_IMG
-
-
-def _read_startup_default(is_img2img: bool) -> bool:
-    config = _read_ui_config()
-    key = UI_KEY_IMG if is_img2img else UI_KEY_TXT
-    if key in config:
-        return bool(config[key])
-    if UI_KEY_TXT in config:
-        return bool(config[UI_KEY_TXT])
-    if UI_KEY_IMG in config:
-        return bool(config[UI_KEY_IMG])
-    return False
-
-
-def _startup_button_label(enabled: bool) -> str:
-    return "Startup auto ON: ON" if enabled else "Startup auto ON: OFF"
-
-
-def _toggle_startup_default_common() -> gr.update:
-    config = _read_ui_config()
-    keys = _startup_keys()
-    current = bool(config.get(UI_KEY_TXT, False))
-    new_value = not current
-    for key in keys:
-        config[key] = new_value
-    _write_ui_config(config)
-    return gr.update(value=_startup_button_label(new_value))
 
 
 def _split_artist_chain(chain: str | None) -> list[str]:
@@ -477,6 +419,135 @@ def _extract_forge_couple_state(attn_module: nn.Module) -> dict[str, Any] | None
     return state
 
 
+def _zero_pad_token_length(tensor: torch.Tensor, target_tokens: int) -> torch.Tensor:
+    if tensor.shape[-2] >= target_tokens:
+        return tensor[..., :target_tokens, :]
+
+    pad_shape = (*tensor.shape[:-2], target_tokens - tensor.shape[-2], tensor.shape[-1])
+    padding = torch.zeros(pad_shape, device=tensor.device, dtype=tensor.dtype)
+    return torch.cat([tensor, padding], dim=-2)
+
+
+def _pad_to_token_multiple(tensor: torch.Tensor, multiple: int = 512) -> torch.Tensor:
+    target_tokens = max(multiple, math.ceil(tensor.shape[-2] / multiple) * multiple)
+    return _zero_pad_token_length(tensor, target_tokens)
+
+
+def _fit_tokens_for_couple(tensor: torch.Tensor, target_tokens: int, pad_value: float = 0.0) -> torch.Tensor:
+    token_count = tensor.shape[-2]
+    if token_count == target_tokens:
+        return tensor
+    if token_count > 0 and target_tokens % token_count == 0:
+        return tensor.repeat(*([1] * (tensor.dim() - 2)), target_tokens // token_count, 1)
+    if token_count < target_tokens:
+        pad_shape = (*tensor.shape[:-2], target_tokens - token_count, tensor.shape[-1])
+        padding = torch.full(pad_shape, pad_value, device=tensor.device, dtype=tensor.dtype)
+        return torch.cat([tensor, padding], dim=-2)
+    return tensor[..., :target_tokens, :]
+
+
+def _lcm_for_values(values: list[int]) -> int:
+    result = 1
+    for value in values:
+        if value <= 0:
+            continue
+        result = result * value // math.gcd(result, value)
+    return result
+
+
+def _forge_couple_region_conds(
+    state: dict[str, Any],
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[torch.Tensor] | None:
+    conds = state.get("conds")
+    num_conds = int(state.get("num_conds", 0))
+    region_count = num_conds - 1
+    if region_count <= 0 or not isinstance(conds, list) or len(conds) < region_count:
+        return None
+
+    result: list[torch.Tensor] = []
+    for cond in conds[:region_count]:
+        if not torch.is_tensor(cond):
+            return None
+        region = cond.to(device=device, dtype=dtype)
+        if region.dim() == 2:
+            region = region.unsqueeze(0)
+        if region.dim() == 4 and region.shape[1] == 1:
+            region = region.squeeze(1)
+        if region.dim() != 3:
+            return None
+        result.append(_pad_to_token_multiple(_broadcast_batch(region, batch_size)))
+
+    return result
+
+
+def _forge_couple_original_region_masks(
+    batch_size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> list[torch.Tensor | None]:
+    try:
+        import scripts.negpip as negpip_module
+    except Exception:
+        return []
+
+    hook_state = getattr(negpip_module, "ANIMA_HOOK_STATE", {}) or {}
+    masks = hook_state.get("forge_couple_negpip_masks") or []
+    result: list[torch.Tensor | None] = []
+    for mask in masks:
+        if not torch.is_tensor(mask):
+            result.append(None)
+            continue
+
+        fitted = mask.to(device=device, dtype=dtype)
+        if fitted.dim() == 1:
+            fitted = fitted.view(1, -1, 1)
+        elif fitted.dim() == 2:
+            fitted = fitted.unsqueeze(0)
+        if fitted.dim() == 4 and fitted.shape[1] == 1:
+            fitted = fitted.squeeze(1)
+        if fitted.dim() != 3:
+            result.append(None)
+            continue
+        result.append(_broadcast_batch(fitted, batch_size))
+
+    return result
+
+
+def _merge_forge_couple_region_context(
+    region: torch.Tensor,
+    artist: torch.Tensor,
+    region_mask: torch.Tensor | None,
+    artist_mask: torch.Tensor | None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    region = _pad_to_token_multiple(region)
+    artist = _pad_to_token_multiple(artist)
+    region_mask = _fit_mask_to_context(region_mask, region) if region_mask is not None else None
+    artist_mask = _fit_mask_to_context(artist_mask, artist) if artist_mask is not None else None
+
+    if region.shape[-2] + artist.shape[-2] <= 1024:
+        merged = _cat_context(artist, region)
+        if region_mask is None and artist_mask is None:
+            return merged, None
+        return merged, _cat_context(
+            _mask_or_ones(artist_mask, artist),
+            _mask_or_ones(region_mask, region),
+        )
+
+    artist_fit = _fit_tokens_for_couple(artist, 512)
+    region_fit = _fit_tokens_for_couple(region, 512)
+    merged = _cat_context(artist_fit, region_fit)
+
+    if region_mask is None and artist_mask is None:
+        return merged, None
+
+    artist_mask_fit = _fit_tokens_for_couple(_mask_or_ones(artist_mask, artist), 512, pad_value=1.0)
+    region_mask_fit = _fit_tokens_for_couple(_mask_or_ones(region_mask, region), 512, pad_value=1.0)
+    return merged, _cat_context(artist_mask_fit, region_mask_fit)
+
+
 def _forge_couple_artist_forward(
     attn_module: nn.Module,
     x: torch.Tensor,
@@ -511,17 +582,32 @@ def _forge_couple_artist_forward(
     height = int(state["height"])
 
     x_chunks = x.chunk(num_chunks, dim=0)
-
-    if context_3d.shape[-2] < 512:
-        context_3d = torch.nn.functional.pad(context_3d, (0, 0, 0, 512 - context_3d.shape[-2]))
-    elif context_3d.shape[-2] % 512 != 0:
-        target_tokens = ((context_3d.shape[-2] + 511) // 512) * 512
-        context_3d = torch.nn.functional.pad(context_3d, (0, 0, 0, target_tokens - context_3d.shape[-2]))
-
+    context_3d = _pad_to_token_multiple(context_3d)
     context_chunks = context_3d.chunk(num_chunks, dim=0)
 
     negpip_mask = _mask_from_options(transformer_options, context_3d)
     negpip_chunks = negpip_mask.chunk(num_chunks, dim=0) if negpip_mask is not None else None
+    region_conds = _forge_couple_region_conds(state, batch_size, context_3d.device, context_3d.dtype)
+    original_region_masks = _forge_couple_original_region_masks(
+        batch_size,
+        context_3d.device,
+        context_3d.dtype,
+    )
+    couple_lcm_tokens = None
+    if region_conds is not None:
+        artist_tokens = context_3d.shape[-2]
+        region_slot_lengths = []
+        for region_cond in region_conds:
+            region_tokens = region_cond.shape[-2]
+            if region_tokens + artist_tokens <= 1024:
+                region_slot_lengths.append(region_tokens + artist_tokens)
+            else:
+                region_slot_lengths.append(1024)
+
+        couple_lcm_tokens = _lcm_for_values([artist_tokens] + region_slot_lengths)
+        if couple_lcm_tokens not in (512, 1024):
+            region_conds = None
+            couple_lcm_tokens = None
 
     new_x = []
     new_context = []
@@ -531,14 +617,55 @@ def _forge_couple_artist_forward(
         c_target = context_chunks[idx]
         if cond_or_uncond == 1:
             new_x.append(x_chunks[idx])
-            new_context.append(c_target)
-            if negpip_chunks is not None:
-                new_negpip_masks.append(negpip_chunks[idx])
+            if couple_lcm_tokens is None:
+                new_context.append(c_target)
+                if negpip_chunks is not None:
+                    new_negpip_masks.append(negpip_chunks[idx])
+            else:
+                c_target_fit = _fit_tokens_for_couple(c_target, couple_lcm_tokens)
+                new_context.append(c_target_fit)
+                if negpip_chunks is not None:
+                    new_negpip_masks.append(_fit_tokens_for_couple(negpip_chunks[idx], couple_lcm_tokens, pad_value=1.0))
         else:
             new_x.append(x_chunks[idx].repeat(num_conds, *([1] * (x.dim() - 1))))
-            new_context.append(c_target.repeat(num_conds, *([1] * (c_target.dim() - 1))))
-            if negpip_chunks is not None:
-                new_negpip_masks.append(negpip_chunks[idx].repeat(num_conds, *([1] * (negpip_chunks[idx].dim() - 1))))
+
+            if region_conds is None or couple_lcm_tokens is None:
+                new_context.append(c_target.repeat(num_conds, *([1] * (c_target.dim() - 1))))
+                if negpip_chunks is not None:
+                    new_negpip_masks.append(negpip_chunks[idx].repeat(num_conds, *([1] * (negpip_chunks[idx].dim() - 1))))
+                continue
+
+            artist_mask = negpip_chunks[idx] if negpip_chunks is not None else None
+            region_slots = []
+            region_slot_masks = []
+            for region_index, region_cond in enumerate(region_conds):
+                region_mask = original_region_masks[region_index] if region_index < len(original_region_masks) else None
+                slot, slot_mask = _merge_forge_couple_region_context(
+                    region_cond,
+                    c_target,
+                    region_mask,
+                    artist_mask,
+                )
+                region_slots.append(slot)
+                region_slot_masks.append(slot_mask)
+
+            c_target_fit = _fit_tokens_for_couple(c_target, couple_lcm_tokens)
+            fitted_slots = [_fit_tokens_for_couple(slot, couple_lcm_tokens) for slot in region_slots]
+            new_context.append(torch.cat([c_target_fit] + fitted_slots, dim=0))
+
+            if negpip_chunks is not None or any(slot_mask is not None for slot_mask in region_slot_masks):
+                base_mask = (
+                    _fit_tokens_for_couple(artist_mask, couple_lcm_tokens, pad_value=1.0)
+                    if artist_mask is not None
+                    else _ones_mask_like(c_target_fit)
+                )
+                fitted_slot_masks = [
+                    _fit_tokens_for_couple(slot_mask, couple_lcm_tokens, pad_value=1.0)
+                    if slot_mask is not None
+                    else _ones_mask_like(slot)
+                    for slot, slot_mask in zip(fitted_slots, region_slot_masks)
+                ]
+                new_negpip_masks.append(torch.cat([base_mask] + fitted_slot_masks, dim=0))
 
     x_in = torch.cat(new_x, dim=0)
     ctx_in = torch.cat(new_context, dim=0).to(dtype=x_in.dtype)
@@ -693,7 +820,7 @@ class _CrossAttnWrapper(nn.Module):
         transformer_options: dict[str, Any] | None = None,
     ) -> torch.Tensor:
         state = self._state
-        if not state.get("enabled", False) or context is None:
+        if context is None:
             return self.original(
                 x,
                 context,
@@ -1132,7 +1259,6 @@ def _patch_unet(
 
     patched_unet = unet.clone()
     state = {
-        "enabled": True,
         "fusion_mode": fusion_mode,
         "combine_mode": combine_mode,
         "strength": float(strength),
@@ -1179,7 +1305,6 @@ def _record_generation_params(
     layer_filter: str,
 ) -> None:
     p.extra_generation_params["Anima Artist Chain"] = ", ".join(artists)
-    p.extra_generation_params["AnimaArtistCrossAttn Enabled"] = True
     p.extra_generation_params["AnimaArtistCrossAttn Strength"] = float(strength)
     p.extra_generation_params["AnimaArtistCrossAttn Combine"] = combine_mode
     p.extra_generation_params["AnimaArtistCrossAttn Fusion"] = fusion_mode
@@ -1212,16 +1337,7 @@ class Script(scripts.Script):
                 visible=False,
             )
 
-        startup_enabled = _read_startup_default(is_img2img)
-
-        with InputAccordion(startup_enabled, label=TITLE, elem_id=f"{id_part}_anima_artist_crossattn") as enabled:
-            with enabled.extra():
-                startup_toggle = gr.Button(
-                    value=_startup_button_label(startup_enabled),
-                    variant="secondary",
-                    elem_id=f"{id_part}_anima_artist_startup_toggle",
-                )
-
+        with gr.Accordion(label=TITLE, open=False, elem_id=f"{id_part}_anima_artist_crossattn"):
             with gr.Row():
                 combine_mode = gr.Radio(
                     choices=COMBINE_CHOICES,
@@ -1284,16 +1400,8 @@ class Script(scripts.Script):
                     placeholder="0,3,5-10,-1",
                 )
 
-            startup_toggle.click(
-                fn=_toggle_startup_default_common,
-                inputs=[],
-                outputs=[startup_toggle],
-                show_progress=False,
-            )
-
         self.infotext_fields = [
             (artist_chain, "Anima Artist Chain"),
-            (enabled, "AnimaArtistCrossAttn Enabled"),
             (strength, "AnimaArtistCrossAttn Strength"),
             (combine_mode, "AnimaArtistCrossAttn Combine"),
             (fusion_mode, "AnimaArtistCrossAttn Fusion"),
@@ -1309,7 +1417,6 @@ class Script(scripts.Script):
 
         return [
             artist_chain,
-            enabled,
             combine_mode,
             fusion_mode,
             strength,
@@ -1326,7 +1433,6 @@ class Script(scripts.Script):
         self,
         p,
         artist_chain: str,
-        enabled: bool,
         combine_mode: str,
         fusion_mode: str,
         strength: float,
@@ -1339,9 +1445,6 @@ class Script(scripts.Script):
         layer_filter: str,
         **kwargs,
     ) -> None:
-        if not enabled:
-            return
-
         artists = _split_artist_chain(artist_chain)
         if not artists:
             return
