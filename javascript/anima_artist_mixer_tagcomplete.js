@@ -14,9 +14,33 @@
         return textArea?.closest?.("#txt2img_anima_artist_chain, #img2img_anima_artist_chain") || null;
     }
 
+    function hasIdentifierPatch(fn, flagName) {
+        const seen = new Set();
+        const stack = [fn];
+
+        while (stack.length > 0) {
+            const current = stack.pop();
+            if (typeof current !== "function" || seen.has(current)) continue;
+            if (current[flagName]) return true;
+
+            seen.add(current);
+            stack.push(current.__aamOriginal, current.__condeltaOriginal);
+        }
+
+        return false;
+    }
+
+    function inheritIdentifierPatchState(target, source) {
+        for (const key of ["__aamPatched", "__aamOriginal", "__condeltaPatched", "__condeltaOriginal"]) {
+            if (Object.prototype.hasOwnProperty.call(source, key)) {
+                target[key] = source[key];
+            }
+        }
+    }
+
     function patchTextAreaIdentifier() {
         if (typeof getTextAreaIdentifier !== "function") return false;
-        if (getTextAreaIdentifier.__aamPatched) return true;
+        if (hasIdentifierPatch(getTextAreaIdentifier, "__aamPatched")) return true;
 
         const original = getTextAreaIdentifier;
         const patched = function (textArea) {
@@ -26,6 +50,7 @@
             return original(textArea);
         };
 
+        inheritIdentifierPatchState(patched, original);
         patched.__aamPatched = true;
         patched.__aamOriginal = original;
 
