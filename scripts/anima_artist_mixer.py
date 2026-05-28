@@ -37,6 +37,7 @@ COMBINE_CHOICES = [COMBINE_OUTPUT_AVG, COMBINE_CONCAT, COMBINE_LOWRANK_AVG]
 MAX_ARTISTS = 32
 STATIC_CAPTURE_K_DEFAULT = 6
 STATIC_CAPTURE_K_MAX = 12
+AAM_TOPROW_PATCH_VERSION = 2
 _EXTRA_NETWORK_RE = re.compile(r"<[^:>]+:[^>]+>")
 
 _ARTIST_COMPONENTS: dict[str, gr.components.Component] = {}
@@ -65,6 +66,28 @@ def _artist_position() -> str:
     return value if value in POSITION_CHOICES else POSITION_BETWEEN
 
 
+def _toprow_artist_components() -> dict[str, gr.components.Component]:
+    from modules.ui_toprow import Toprow
+
+    registry = getattr(Toprow, "_aam_artist_components", None)
+    if not isinstance(registry, dict):
+        registry = {}
+        Toprow._aam_artist_components = registry
+    return registry
+
+
+def _remember_artist_chain(id_part: str, artist_chain: gr.Textbox) -> None:
+    _ARTIST_COMPONENTS[id_part] = artist_chain
+    _toprow_artist_components()[id_part] = artist_chain
+
+
+def _artist_chain_component(id_part: str) -> gr.components.Component | None:
+    component = _ARTIST_COMPONENTS.get(id_part)
+    if component is not None:
+        return component
+    return _toprow_artist_components().get(id_part)
+
+
 def _create_artist_chain_row(toprow: Any) -> gr.Textbox:
     id_part = toprow.id_part
     with gr.Row(
@@ -82,15 +105,20 @@ def _create_artist_chain_row(toprow: Any) -> gr.Textbox:
         )
 
     toprow.anima_artist_chain = artist_chain
-    _ARTIST_COMPONENTS[id_part] = artist_chain
+    _remember_artist_chain(id_part, artist_chain)
     return artist_chain
 
 
 def _patch_toprow() -> None:
     from modules.ui_toprow import Toprow
 
-    if getattr(Toprow.create_prompts, "_aam_patched", False):
+    current_create_prompts = Toprow.create_prompts
+    if (
+        getattr(current_create_prompts, "_aam_patch_version", 0) >= AAM_TOPROW_PATCH_VERSION
+        and getattr(current_create_prompts, "_aam_uses_shared_registry", False)
+    ):
         return
+    original_create_prompts = getattr(current_create_prompts, "_aam_original", current_create_prompts)
 
     def create_prompts(self):
         with gr.Column(
@@ -153,7 +181,9 @@ def _patch_toprow() -> None:
         )
 
     create_prompts._aam_patched = True
-    create_prompts._aam_original = Toprow.create_prompts
+    create_prompts._aam_original = original_create_prompts
+    create_prompts._aam_patch_version = AAM_TOPROW_PATCH_VERSION
+    create_prompts._aam_uses_shared_registry = True
     Toprow.create_prompts = create_prompts
 
 
@@ -2078,8 +2108,13 @@ class Script(scripts.Script):
 
     def ui(self, is_img2img):
         id_part = "img2img" if is_img2img else "txt2img"
-        artist_chain = _ARTIST_COMPONENTS.get(id_part)
+        artist_chain = _artist_chain_component(id_part)
         if artist_chain is None:
+            logger.warning(
+                "[AnimaArtistMixer] visible %s Artist Chain textbox was not registered; "
+                "using hidden fallback for this UI session. Reload UI after startup.",
+                id_part,
+            )
             artist_chain = gr.Textbox(
                 label="Artist Chain",
                 elem_id=f"{id_part}_anima_artist_chain_hidden",
