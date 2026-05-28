@@ -26,13 +26,17 @@ POSITION_CHOICES = [POSITION_ABOVE, POSITION_BETWEEN, POSITION_BELOW]
 
 FUSION_INTERPOLATE = "interpolate"
 FUSION_CONCAT_WITH_BASE = "concat_with_base"
-FUSION_CHOICES = [FUSION_INTERPOLATE, FUSION_CONCAT_WITH_BASE]
+FUSION_BASE_PRESERVE = "base_preserve"
+FUSION_CHOICES = [FUSION_INTERPOLATE, FUSION_CONCAT_WITH_BASE, FUSION_BASE_PRESERVE]
 
 COMBINE_CONCAT = "concat"
 COMBINE_OUTPUT_AVG = "output_avg"
-COMBINE_CHOICES = [COMBINE_OUTPUT_AVG, COMBINE_CONCAT]
+COMBINE_LOWRANK_AVG = "lowrank_avg"
+COMBINE_CHOICES = [COMBINE_OUTPUT_AVG, COMBINE_CONCAT, COMBINE_LOWRANK_AVG]
 
 MAX_ARTISTS = 32
+STATIC_CAPTURE_K_DEFAULT = 6
+STATIC_CAPTURE_K_MAX = 12
 _EXTRA_NETWORK_RE = re.compile(r"<[^:>]+:[^>]+>")
 
 _ARTIST_COMPONENTS: dict[str, gr.components.Component] = {}
@@ -165,6 +169,38 @@ def _split_artist_chain(chain: str | None) -> list[str]:
     return [part for part in parts if part]
 
 
+def _parse_artist_weights(parts: list[str]) -> tuple[list[str], list[float], bool]:
+    names: list[str] = []
+    weights: list[float] = []
+    has_explicit = False
+
+    for raw in parts:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+
+        weight = 1.0
+        explicit = False
+        if "::" in text:
+            head = text[2:] if text.startswith("::") else text
+            if "::" in head:
+                name_part, _, weight_part = head.rpartition("::")
+                try:
+                    weight = max(0.0, min(4.0, float(weight_part.strip())))
+                    text = name_part.strip()
+                    explicit = True
+                except ValueError:
+                    pass
+
+        if not text:
+            continue
+        names.append(text)
+        weights.append(weight)
+        has_explicit = has_explicit or explicit
+
+    return names, weights, has_explicit
+
+
 def _parse_layer_filter(text: str | None, num_blocks: int) -> list[int] | None:
     if not text:
         return None
@@ -215,6 +251,18 @@ def _normalize_weights(weights: list[float]) -> list[float]:
     if total <= 1e-8:
         return [1.0 / len(weights)] * len(weights)
     return [weight / total for weight in weights]
+
+
+def _clamp_strength(value: float) -> float:
+    return max(0.0, min(4.0, float(value)))
+
+
+def _project_perpendicular(delta: torch.Tensor, base: torch.Tensor) -> torch.Tensor:
+    base_f = base.float()
+    delta_f = delta.float()
+    denom = (base_f * base_f).sum(dim=-1, keepdim=True).clamp_min(1e-8)
+    parallel = ((delta_f * base_f).sum(dim=-1, keepdim=True) / denom) * base_f
+    return (delta_f - parallel).to(dtype=delta.dtype, device=delta.device)
 
 
 def _unwrap_cross_attn(cross_attn: nn.Module) -> nn.Module:
@@ -791,6 +839,12 @@ class _CrossAttnWrapper(nn.Module):
         self._deferred_signature = None
         self._deferred_delta_sum: torch.Tensor | None = None
         self._deferred_count = 0
+        self._static_signature = None
+        self._static_seen_sigmas: set[float] = set()
+        self._static_accumulator: list[torch.Tensor] | None = None
+        self._static_count = 0
+        self._static_frozen_outputs: list[torch.Tensor] | None = None
+        self._static_max_sigma: float | None = None
 
     def _call_original(
         self,
@@ -891,7 +945,22 @@ class _CrossAttnWrapper(nn.Module):
                 transformer_options=transformer_options,
             )
 
-        if state["combine_mode"] == COMBINE_OUTPUT_AVG:
+        combine_mode = state["combine_mode"]
+        if combine_mode == COMBINE_LOWRANK_AVG and len(individuals) >= 2:
+            return self._fwd_lowrank_avg(
+                x,
+                context,
+                rope_emb,
+                transformer_options,
+                individuals,
+                individual_masks,
+                weights,
+                mask,
+                state["fusion_mode"],
+                float(state["strength"]),
+            )
+
+        if combine_mode in (COMBINE_OUTPUT_AVG, COMBINE_LOWRANK_AVG):
             return self._fwd_output_avg(
                 x,
                 context,
@@ -933,6 +1002,7 @@ class _CrossAttnWrapper(nn.Module):
         strength: float,
     ) -> torch.Tensor:
         normalized_weights = _normalize_weights(weights) if self._state.get("normalize_weights", True) else list(weights)
+        force_collect = self._state.get("artist_static_capture", False) and fusion_mode != FUSION_CONCAT_WITH_BASE
 
         if self._deferred_cache_enabled(transformer_options):
             deferred = self._fwd_output_avg_deferred(
@@ -950,18 +1020,31 @@ class _CrossAttnWrapper(nn.Module):
             if deferred is not None:
                 return deferred
 
-        artist_total = self._output_avg_artist_total(
-            x,
-            context,
-            rope_emb,
-            transformer_options,
-            individuals,
-            individual_masks,
-            normalized_weights,
-            fusion_mode,
-        )
+        if force_collect:
+            artist_outputs = self._artist_outputs_with_static_cache(
+                x,
+                context,
+                rope_emb,
+                transformer_options,
+                individuals,
+                individual_masks,
+                fusion_mode,
+            )
+            artist_total = self._weighted_sum_outputs(artist_outputs, normalized_weights)
+        else:
+            artist_total = self._output_avg_artist_total(
+                x,
+                context,
+                rope_emb,
+                transformer_options,
+                individuals,
+                individual_masks,
+                normalized_weights,
+                fusion_mode,
+            )
+        artist_total = self._apply_ema(artist_total, fusion_mode)
 
-        if strength >= 1.0 and all(mask):
+        if fusion_mode == FUSION_INTERPOLATE and strength == 1.0 and all(mask):
             return artist_total
 
         base_out = self.original(
@@ -970,7 +1053,7 @@ class _CrossAttnWrapper(nn.Module):
             rope_emb=rope_emb,
             transformer_options=transformer_options,
         )
-        return self._blend_output_avg(base_out, artist_total, mask, strength)
+        return self._apply_fusion(base_out, artist_total, mask, fusion_mode, strength)
 
     def _output_avg_artist_total(
         self,
@@ -983,65 +1066,243 @@ class _CrossAttnWrapper(nn.Module):
         normalized_weights: list[float],
         fusion_mode: str,
     ) -> torch.Tensor:
-        batch_size = context.shape[0]
-        artist_total = None
+        artist_outputs = self._collect_artist_outputs(
+            x,
+            context,
+            rope_emb,
+            transformer_options,
+            individuals,
+            individual_masks,
+            fusion_mode,
+        )
+        return self._weighted_sum_outputs(artist_outputs, normalized_weights)
 
+    def _collect_artist_outputs(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        rope_emb: torch.Tensor | None,
+        transformer_options: dict[str, Any],
+        individuals: list[torch.Tensor],
+        individual_masks: list[torch.Tensor | None],
+        fusion_mode: str,
+    ) -> list[torch.Tensor]:
         if len(individuals) >= 2 and not self._state.get("_disable_batched", False):
             try:
-                artist_total = self._batched_artists_forward(
+                return self._batched_artists_outputs_only(
                     x,
                     context,
                     rope_emb,
                     transformer_options,
                     individuals,
                     individual_masks,
-                    normalized_weights,
                     fusion_mode,
                 )
             except Exception as exc:
                 if not self._state.get("_warned_batched", False):
                     logger.warning(
-                        "[AnimaArtistMixer] batched output_avg failed; using serial fallback: %s",
+                        "[AnimaArtistMixer] batched artist outputs failed; using serial fallback: %s",
                         exc,
                     )
                     self._state["_warned_batched"] = True
                     self._state["_disable_batched"] = True
-                artist_total = None
 
-        if artist_total is None:
-            for artist, artist_mask, weight in zip(individuals, individual_masks, normalized_weights):
-                artist_b = _broadcast_batch(artist, batch_size).to(device=context.device, dtype=context.dtype)
-                artist_mask_b = _fit_mask_to_context(artist_mask, artist_b)
+        batch_size = context.shape[0]
+        outputs: list[torch.Tensor] = []
+        for artist, artist_mask in zip(individuals, individual_masks):
+            artist_b = _broadcast_batch(artist, batch_size).to(device=context.device, dtype=context.dtype)
+            artist_mask_b = _fit_mask_to_context(artist_mask, artist_b)
 
-                if fusion_mode == FUSION_CONCAT_WITH_BASE:
-                    base_mask = _mask_or_ones(_mask_from_options(transformer_options, context), context)
-                    kv = _cat_context(context, artist_b)
-                    kv_mask = _cat_context(base_mask, _mask_or_ones(artist_mask_b, artist_b))
-                else:
-                    kv = artist_b
-                    kv_mask = artist_mask_b
+            if fusion_mode == FUSION_CONCAT_WITH_BASE:
+                base_mask = _mask_or_ones(_mask_from_options(transformer_options, context), context)
+                kv = _cat_context(context, artist_b)
+                kv_mask = _cat_context(base_mask, _mask_or_ones(artist_mask_b, artist_b))
+            else:
+                kv = artist_b
+                kv_mask = artist_mask_b
 
-                out_i = self._call_original(
+            outputs.append(
+                self._call_original(
                     x,
                     kv,
                     rope_emb,
                     _with_negpip_mask(transformer_options, kv_mask),
                     forge_couple_artist=True,
                 )
-                artist_total = out_i * weight if artist_total is None else artist_total + out_i * weight
+            )
 
-        if artist_total is None:
-            raise RuntimeError("output_avg artist_total was not computed")
+        if not outputs:
+            raise RuntimeError("artist output list was empty")
+        return outputs
 
+    def _weighted_sum_outputs(
+        self,
+        outputs: list[torch.Tensor],
+        weights: list[float],
+    ) -> torch.Tensor:
+        result = None
+        for output, weight in zip(outputs, weights):
+            result = output * weight if result is None else result + output * weight
+        if result is None:
+            raise RuntimeError("artist output list was empty")
+        return result
+
+    def _static_cache_signature(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        transformer_options: dict[str, Any],
+        individuals: list[torch.Tensor],
+        individual_masks: list[torch.Tensor | None],
+        fusion_mode: str,
+    ) -> tuple[Any, ...]:
+        cond_or_uncond = transformer_options.get("cond_or_uncond") if isinstance(transformer_options, dict) else None
+        negpip_mask = transformer_options.get("negpip_mask") if isinstance(transformer_options, dict) else None
+        return (
+            tuple(x.shape),
+            tuple(context.shape),
+            str(x.dtype),
+            str(context.dtype),
+            tuple(cond_or_uncond or ()),
+            fusion_mode,
+            tuple(tuple(artist.shape) for artist in individuals),
+            tuple(_shape_tuple(mask) for mask in individual_masks),
+            _shape_tuple(negpip_mask),
+        )
+
+    def _reset_static_cache(self) -> None:
+        self._static_signature = None
+        self._static_seen_sigmas.clear()
+        self._static_accumulator = None
+        self._static_count = 0
+        self._static_frozen_outputs = None
+        self._static_max_sigma = None
+
+    def _maybe_reset_static_cache(
+        self,
+        signature: tuple[Any, ...],
+        current_sigma: float | None,
+    ) -> None:
+        if self._static_signature is not None and self._static_signature != signature:
+            self._reset_static_cache()
+
+        if current_sigma is not None:
+            if self._static_max_sigma is not None and float(current_sigma) > float(self._static_max_sigma) + 1e-3:
+                self._reset_static_cache()
+            self._static_max_sigma = (
+                float(current_sigma)
+                if self._static_max_sigma is None
+                else max(float(self._static_max_sigma), float(current_sigma))
+            )
+
+        if self._static_signature is None:
+            self._static_signature = signature
+
+    def _artist_outputs_with_static_cache(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        rope_emb: torch.Tensor | None,
+        transformer_options: dict[str, Any],
+        individuals: list[torch.Tensor],
+        individual_masks: list[torch.Tensor | None],
+        fusion_mode: str,
+    ) -> list[torch.Tensor]:
+        capture_k = max(1, min(STATIC_CAPTURE_K_MAX, int(self._state.get("static_capture_k", STATIC_CAPTURE_K_DEFAULT))))
+        current_sigma = self._state.get("current_sigma")
+        current_sigma = float(current_sigma) if current_sigma is not None else None
+        signature = self._static_cache_signature(
+            x,
+            context,
+            transformer_options,
+            individuals,
+            individual_masks,
+            fusion_mode,
+        )
+        self._maybe_reset_static_cache(signature, current_sigma)
+
+        if self._static_frozen_outputs is not None:
+            return [
+                output.to(device=context.device, dtype=x.dtype)
+                for output in self._static_frozen_outputs
+            ]
+
+        outputs = self._collect_artist_outputs(
+            x,
+            context,
+            rope_emb,
+            transformer_options,
+            individuals,
+            individual_masks,
+            fusion_mode,
+        )
+
+        sigma_key = round(current_sigma, 6) if current_sigma is not None else float(self._static_count)
+        if sigma_key not in self._static_seen_sigmas:
+            self._static_seen_sigmas.add(sigma_key)
+            detached = [output.detach() for output in outputs]
+            if self._static_accumulator is None:
+                self._static_accumulator = [output.clone() for output in detached]
+            else:
+                self._static_accumulator = [
+                    acc.to(device=output.device, dtype=output.dtype) + output
+                    for acc, output in zip(self._static_accumulator, detached)
+                ]
+            self._static_count += 1
+
+            if self._static_count >= capture_k and self._static_accumulator is not None:
+                self._static_frozen_outputs = [
+                    (acc / float(self._static_count)).detach()
+                    for acc in self._static_accumulator
+                ]
+                return [
+                    output.to(device=context.device, dtype=x.dtype)
+                    for output in self._static_frozen_outputs
+                ]
+
+        return outputs
+
+    def _maybe_reset_ema(self) -> None:
+        current_sigma = self._state.get("current_sigma")
+        if current_sigma is None:
+            return
+        previous_sigma = self._state.get("_ema_last_sigma")
+        if previous_sigma is None or float(current_sigma) > float(previous_sigma) + 1e-3:
+            self._state["_ema_cache"] = {}
+        self._state["_ema_last_sigma"] = float(current_sigma)
+
+    def _apply_ema(self, artist_total: torch.Tensor, fusion_mode: str) -> torch.Tensor:
+        if fusion_mode not in (FUSION_INTERPOLATE, FUSION_BASE_PRESERVE):
+            return artist_total
+
+        ema_alpha = float(self._state.get("artist_ema_alpha", 0.0))
+        if ema_alpha <= 0.0:
+            return artist_total
+
+        self._maybe_reset_ema()
+        cache = self._state.setdefault("_ema_cache", {})
+        previous = cache.get(self._layer_idx)
+        if previous is not None and previous.shape == artist_total.shape:
+            artist_total = ema_alpha * previous.to(artist_total) + (1.0 - ema_alpha) * artist_total
+        cache[self._layer_idx] = artist_total.detach()
         return artist_total
 
-    def _blend_output_avg(
+    def _apply_fusion(
         self,
         base_out: torch.Tensor,
         artist_total: torch.Tensor,
         mask: list[bool],
+        fusion_mode: str,
         strength: float,
     ) -> torch.Tensor:
+        if fusion_mode == FUSION_BASE_PRESERVE:
+            delta = _project_perpendicular(artist_total - base_out, base_out)
+            out = base_out.clone()
+            for row, hit in enumerate(mask):
+                if hit:
+                    out[row] = base_out[row] + delta[row] * strength
+            return out
+
         out = base_out.clone()
         for row, hit in enumerate(mask):
             if hit:
@@ -1055,6 +1316,8 @@ class _CrossAttnWrapper(nn.Module):
         if state.get("_deferred_disabled_forge_couple", False):
             return False
         if state.get("combine_mode") != COMBINE_OUTPUT_AVG:
+            return False
+        if state.get("artist_static_capture", False):
             return False
         if state.get("deferred_warmup_sigma") is None:
             return False
@@ -1138,11 +1401,8 @@ class _CrossAttnWrapper(nn.Module):
                 device=base_out.device,
                 dtype=base_out.dtype,
             )
-            out = base_out.clone()
-            for row, hit in enumerate(mask):
-                if hit:
-                    out[row] = base_out[row] + cached_delta[row] * strength
-            return out
+            cached_artist_total = self._apply_ema(base_out + cached_delta, fusion_mode)
+            return self._apply_fusion(base_out, cached_artist_total, mask, fusion_mode, strength)
 
         artist_total = self._output_avg_artist_total(
             x,
@@ -1154,6 +1414,7 @@ class _CrossAttnWrapper(nn.Module):
             normalized_weights,
             fusion_mode,
         )
+        artist_total = self._apply_ema(artist_total, fusion_mode)
 
         if in_warmup:
             delta = (artist_total - base_out).detach()
@@ -1165,9 +1426,25 @@ class _CrossAttnWrapper(nn.Module):
                 self._deferred_delta_sum = self._deferred_delta_sum + delta
                 self._deferred_count += 1
 
-        return self._blend_output_avg(base_out, artist_total, mask, strength)
+        return self._apply_fusion(base_out, artist_total, mask, fusion_mode, strength)
 
-    def _batched_artists_forward(
+    def _truncate_delta_lowrank(self, delta: torch.Tensor, lowrank_k: int) -> torch.Tensor:
+        if delta.dim() < 2:
+            return delta
+
+        rows = delta.shape[-2]
+        cols = delta.shape[-1]
+        rank = max(1, min(int(lowrank_k), rows, cols))
+        if rank >= min(rows, cols):
+            return delta
+
+        original_shape = delta.shape
+        matrix = delta.float().reshape(-1, rows, cols)
+        u, s, vh = torch.linalg.svd(matrix, full_matrices=False)
+        truncated = (u[:, :, :rank] * s[:, :rank].unsqueeze(-2)) @ vh[:, :rank, :]
+        return truncated.reshape(original_shape).to(device=delta.device, dtype=delta.dtype)
+
+    def _fwd_lowrank_avg(
         self,
         x: torch.Tensor,
         context: torch.Tensor,
@@ -1176,8 +1453,92 @@ class _CrossAttnWrapper(nn.Module):
         individuals: list[torch.Tensor],
         individual_masks: list[torch.Tensor | None],
         weights: list[float],
+        mask: list[bool],
         fusion_mode: str,
+        strength: float,
     ) -> torch.Tensor:
+        lowrank_k = max(1, int(self._state.get("lowrank_k", 1)))
+        if lowrank_k >= len(individuals):
+            return self._fwd_output_avg(
+                x,
+                context,
+                rope_emb,
+                transformer_options,
+                individuals,
+                individual_masks,
+                weights,
+                mask,
+                fusion_mode,
+                strength,
+            )
+
+        normalized_weights = _normalize_weights(weights) if self._state.get("normalize_weights", True) else list(weights)
+        base_out = self.original(
+            x,
+            context,
+            rope_emb=rope_emb,
+            transformer_options=transformer_options,
+        )
+
+        try:
+            if self._state.get("artist_static_capture", False) and fusion_mode != FUSION_CONCAT_WITH_BASE:
+                artist_outputs = self._artist_outputs_with_static_cache(
+                    x,
+                    context,
+                    rope_emb,
+                    transformer_options,
+                    individuals,
+                    individual_masks,
+                    fusion_mode,
+                )
+            else:
+                artist_outputs = self._collect_artist_outputs(
+                    x,
+                    context,
+                    rope_emb,
+                    transformer_options,
+                    individuals,
+                    individual_masks,
+                    fusion_mode,
+                )
+
+            delta_total = torch.zeros_like(base_out)
+            for artist_out, weight in zip(artist_outputs, normalized_weights):
+                delta_total = delta_total + self._truncate_delta_lowrank(artist_out - base_out, lowrank_k) * weight
+            artist_total = base_out + delta_total
+        except Exception as exc:
+            if not self._state.get("_warned_lowrank", False):
+                logger.warning(
+                    "[AnimaArtistMixer] lowrank_avg failed; using output_avg fallback: %s",
+                    exc,
+                )
+                self._state["_warned_lowrank"] = True
+            return self._fwd_output_avg(
+                x,
+                context,
+                rope_emb,
+                transformer_options,
+                individuals,
+                individual_masks,
+                weights,
+                mask,
+                fusion_mode,
+                strength,
+            )
+
+        artist_total = self._apply_ema(artist_total, fusion_mode)
+        return self._apply_fusion(base_out, artist_total, mask, fusion_mode, strength)
+
+    def _batched_artists_outputs_only(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        rope_emb: torch.Tensor | None,
+        transformer_options: dict[str, Any],
+        individuals: list[torch.Tensor],
+        individual_masks: list[torch.Tensor | None],
+        fusion_mode: str,
+    ) -> list[torch.Tensor]:
         batch_size = context.shape[0]
         artist_count = len(individuals)
         kv_list = []
@@ -1230,8 +1591,33 @@ class _CrossAttnWrapper(nn.Module):
             forge_couple_artist=True,
         )
         out = out.view(artist_count, batch_size, *out.shape[1:])
+        return [chunk for chunk in out.unbind(dim=0)]
+
+    def _batched_artists_forward(
+        self,
+        x: torch.Tensor,
+        context: torch.Tensor,
+        rope_emb: torch.Tensor | None,
+        transformer_options: dict[str, Any],
+        individuals: list[torch.Tensor],
+        individual_masks: list[torch.Tensor | None],
+        weights: list[float],
+        fusion_mode: str,
+    ) -> torch.Tensor:
+        out = torch.stack(
+            self._batched_artists_outputs_only(
+                x,
+                context,
+                rope_emb,
+                transformer_options,
+                individuals,
+                individual_masks,
+                fusion_mode,
+            ),
+            dim=0,
+        )
         weight_tensor = torch.tensor(weights, device=out.device, dtype=out.dtype).view(
-            artist_count,
+            out.shape[0],
             *([1] * (out.dim() - 1)),
         )
         return (out * weight_tensor).sum(dim=0)
@@ -1252,7 +1638,7 @@ class _CrossAttnWrapper(nn.Module):
         artist_b = _broadcast_batch(combined, batch_size).to(device=context.device, dtype=context.dtype)
         artist_mask_b = _fit_mask_to_context(combined_mask, artist_b)
 
-        if fusion_mode == FUSION_INTERPOLATE:
+        if fusion_mode in (FUSION_INTERPOLATE, FUSION_BASE_PRESERVE):
             base_out = self.original(
                 x,
                 context,
@@ -1266,11 +1652,8 @@ class _CrossAttnWrapper(nn.Module):
                 _with_negpip_mask(transformer_options, artist_mask_b),
                 forge_couple_artist=True,
             )
-            out = base_out.clone()
-            for row, hit in enumerate(mask):
-                if hit:
-                    out[row] = base_out[row] * (1.0 - strength) + artist_out[row] * strength
-            return out
+            artist_out = self._apply_ema(artist_out, fusion_mode)
+            return self._apply_fusion(base_out, artist_out, mask, fusion_mode, strength)
 
         extension = torch.zeros_like(artist_b)
         extension_mask = _ones_mask_like(artist_b)
@@ -1435,10 +1818,14 @@ def _merge_similar_artists(
     artists: list[str],
     individuals: list[torch.Tensor],
     individual_masks: list[torch.Tensor | None],
+    base_weights: list[float],
     threshold: float,
 ) -> tuple[list[torch.Tensor], list[torch.Tensor | None], list[float], str]:
+    if len(base_weights) < len(individuals):
+        base_weights = list(base_weights) + [1.0] * (len(individuals) - len(base_weights))
+
     if len(individuals) <= 1:
-        return individuals, individual_masks, [1.0] * len(individuals), ""
+        return individuals, individual_masks, list(base_weights), ""
 
     threshold = _clamp01(threshold)
     clusters = _similar_artist_clusters(individuals, threshold)
@@ -1458,15 +1845,27 @@ def _merge_similar_artists(
             for index in members:
                 merged_individuals.append(individuals[index])
                 merged_masks.append(individual_masks[index])
-                merged_weights.append(1.0)
+                merged_weights.append(float(base_weights[index]))
             continue
 
-        stacked = torch.stack([individuals[index] for index in members], dim=0)
-        merged_individuals.append(stacked.mean(dim=0))
+        cluster_weight = sum(float(base_weights[index]) for index in members)
+        if cluster_weight > 1e-8:
+            merged = None
+            for index in members:
+                part = individuals[index] * (float(base_weights[index]) / cluster_weight)
+                merged = part if merged is None else merged + part
+            if merged is None:
+                stacked = torch.stack([individuals[index] for index in members], dim=0)
+                merged = stacked.mean(dim=0)
+        else:
+            stacked = torch.stack([individuals[index] for index in members], dim=0)
+            merged = stacked.mean(dim=0)
+
+        merged_individuals.append(merged)
         merged_masks.append(None)
-        merged_weights.append(float(len(members)))
+        merged_weights.append(float(cluster_weight))
         labels = ", ".join(artists[index] for index in members)
-        summary_parts.append(f"[{labels}] -> weight {len(members)}")
+        summary_parts.append(f"[{labels}] -> weight {cluster_weight:.3g}")
 
     return merged_individuals, merged_masks, merged_weights, "; ".join(summary_parts)
 
@@ -1558,6 +1957,11 @@ def _patch_unet(
     layer_filter: str,
     deferred_cache: bool,
     deferred_warmup_sigma: float | None,
+    lowrank_k: int,
+    artist_ema_alpha: float,
+    artist_static_capture: bool,
+    static_capture_k: int,
+    has_explicit_weights: bool,
 ) -> Any:
     diffusion_model = _diffusion_model_from_unet(unet)
 
@@ -1582,6 +1986,13 @@ def _patch_unet(
         "current_sigma": None,
         "deferred_cache": bool(deferred_cache and combine_mode == COMBINE_OUTPUT_AVG and deferred_warmup_sigma is not None),
         "deferred_warmup_sigma": deferred_warmup_sigma,
+        "lowrank_k": max(1, int(lowrank_k)),
+        "artist_ema_alpha": _clamp01(artist_ema_alpha),
+        "artist_static_capture": bool(artist_static_capture),
+        "static_capture_k": max(1, min(STATIC_CAPTURE_K_MAX, int(static_capture_k))),
+        "has_explicit_weights": bool(has_explicit_weights),
+        "_ema_cache": {},
+        "_ema_last_sigma": None,
     }
 
     patch_pairs = []
@@ -1622,6 +2033,11 @@ def _record_generation_params(
     merge_similar: bool,
     merge_threshold: float,
     merge_summary: str,
+    lowrank_k: int,
+    artist_ema_alpha: float,
+    artist_static_capture: bool,
+    static_capture_k: int,
+    has_explicit_weights: bool,
 ) -> None:
     p.extra_generation_params["AnimaArtistCrossAttn"] = f"Active ({len(artists)} artists)"
     p.extra_generation_params["Anima Artist Chain"] = ", ".join(artists)
@@ -1630,6 +2046,7 @@ def _record_generation_params(
     p.extra_generation_params["AnimaArtistCrossAttn Fusion"] = fusion_mode
     p.extra_generation_params["AnimaArtistCrossAttn Apply Uncond"] = bool(apply_to_uncond)
     p.extra_generation_params["AnimaArtistCrossAttn Normalize Weights"] = bool(normalize_weights)
+    p.extra_generation_params["AnimaArtistCrossAttn Explicit Weights"] = bool(has_explicit_weights)
     p.extra_generation_params["AnimaArtistCrossAttn Start Block"] = int(start_block)
     p.extra_generation_params["AnimaArtistCrossAttn End Block"] = int(end_block)
     p.extra_generation_params["AnimaArtistCrossAttn Start Percent"] = float(start_percent)
@@ -1640,6 +2057,10 @@ def _record_generation_params(
     p.extra_generation_params["AnimaArtistCrossAttn Deferred Cache Warmup Percent"] = float(deferred_warmup_percent)
     p.extra_generation_params["AnimaArtistCrossAttn Merge Similar Artists"] = bool(merge_similar)
     p.extra_generation_params["AnimaArtistCrossAttn Merge Similar Threshold"] = float(merge_threshold)
+    p.extra_generation_params["AnimaArtistCrossAttn Lowrank K"] = int(lowrank_k)
+    p.extra_generation_params["AnimaArtistCrossAttn Artist EMA Alpha"] = float(artist_ema_alpha)
+    p.extra_generation_params["AnimaArtistCrossAttn Artist Static Capture"] = bool(artist_static_capture)
+    p.extra_generation_params["AnimaArtistCrossAttn Static Capture K"] = int(static_capture_k)
     if effective_artist_count != len(artists):
         p.extra_generation_params["AnimaArtistCrossAttn Effective Artists"] = int(effective_artist_count)
     if merge_summary:
@@ -1679,9 +2100,9 @@ class Script(scripts.Script):
                 )
                 strength = gr.Slider(
                     minimum=0.0,
-                    maximum=1.0,
+                    maximum=4.0,
                     value=1.0,
-                    step=0.01,
+                    step=0.05,
                     label="Strength",
                 )
 
@@ -1728,6 +2149,30 @@ class Script(scripts.Script):
                     placeholder="0,3,5-10,-1",
                 )
                 with gr.Row():
+                    lowrank_k = gr.Slider(
+                        minimum=1,
+                        maximum=MAX_ARTISTS,
+                        value=1,
+                        step=1,
+                        label="Lowrank K",
+                    )
+                    artist_ema_alpha = gr.Slider(
+                        minimum=0.0,
+                        maximum=0.95,
+                        value=0.0,
+                        step=0.05,
+                        label="Artist EMA Alpha",
+                    )
+                with gr.Row():
+                    artist_static_capture = gr.Checkbox(value=False, label="Artist Static Capture")
+                    static_capture_k = gr.Slider(
+                        minimum=1,
+                        maximum=STATIC_CAPTURE_K_MAX,
+                        value=STATIC_CAPTURE_K_DEFAULT,
+                        step=1,
+                        label="Static Capture K",
+                    )
+                with gr.Row():
                     deferred_cache = gr.Checkbox(value=False, label="Experimental: Deferred Cache")
                     deferred_warmup_percent = gr.Slider(
                         minimum=0.0,
@@ -1762,6 +2207,10 @@ class Script(scripts.Script):
             (deferred_warmup_percent, "AnimaArtistCrossAttn Deferred Cache Warmup Percent"),
             (merge_similar, "AnimaArtistCrossAttn Merge Similar Artists"),
             (merge_threshold, "AnimaArtistCrossAttn Merge Similar Threshold"),
+            (lowrank_k, "AnimaArtistCrossAttn Lowrank K"),
+            (artist_ema_alpha, "AnimaArtistCrossAttn Artist EMA Alpha"),
+            (artist_static_capture, "AnimaArtistCrossAttn Artist Static Capture"),
+            (static_capture_k, "AnimaArtistCrossAttn Static Capture K"),
         ]
         self.paste_field_names = [name for _, name in self.infotext_fields]
 
@@ -1781,6 +2230,10 @@ class Script(scripts.Script):
             deferred_warmup_percent,
             merge_similar,
             merge_threshold,
+            lowrank_k,
+            artist_ema_alpha,
+            artist_static_capture,
+            static_capture_k,
         ]
 
     def process_before_every_sampling(
@@ -1801,9 +2254,14 @@ class Script(scripts.Script):
         deferred_warmup_percent: float,
         merge_similar: bool,
         merge_threshold: float,
+        lowrank_k: int,
+        artist_ema_alpha: float,
+        artist_static_capture: bool,
+        static_capture_k: int,
         **kwargs,
     ) -> None:
-        artists = _split_artist_chain(artist_chain)
+        artist_entries = _split_artist_chain(artist_chain)
+        artists, parsed_weights, has_explicit_weights = _parse_artist_weights(artist_entries)
         if not artists:
             return
 
@@ -1817,28 +2275,42 @@ class Script(scripts.Script):
                 MAX_ARTISTS,
             )
             artists = artists[:MAX_ARTISTS]
+            artist_entries = artist_entries[:MAX_ARTISTS]
+            parsed_weights = parsed_weights[:MAX_ARTISTS]
 
         if combine_mode not in COMBINE_CHOICES:
             combine_mode = COMBINE_OUTPUT_AVG
         if fusion_mode not in FUSION_CHOICES:
             fusion_mode = FUSION_INTERPOLATE
 
+        strength = _clamp_strength(strength)
         start_percent = _clamp01(start_percent)
         end_percent = _clamp01(end_percent)
         deferred_warmup_percent = _clamp01(deferred_warmup_percent)
         merge_threshold = _clamp01(merge_threshold)
+        lowrank_k = max(1, min(MAX_ARTISTS, int(lowrank_k)))
+        artist_ema_alpha = _clamp01(artist_ema_alpha)
+        static_capture_k = max(1, min(STATIC_CAPTURE_K_MAX, int(static_capture_k)))
 
         unet = p.sd_model.forge_objects.unet
         forge_couple_detected = _unet_has_forge_couple(unet)
         output_avg_mode = combine_mode == COMBINE_OUTPUT_AVG
-        effective_deferred_cache = bool(deferred_cache) and output_avg_mode and not forge_couple_detected
+        static_capture_mode = combine_mode in (COMBINE_OUTPUT_AVG, COMBINE_LOWRANK_AVG)
+        effective_static_capture = (
+            bool(artist_static_capture)
+            and static_capture_mode
+            and fusion_mode != FUSION_CONCAT_WITH_BASE
+            and not forge_couple_detected
+        )
+        effective_deferred_cache = bool(deferred_cache) and output_avg_mode and not forge_couple_detected and not effective_static_capture
         effective_merge_similar = bool(merge_similar) and output_avg_mode and not forge_couple_detected
         deferred_warmup_sigma = _sigma_at_percent(unet, deferred_warmup_percent) if effective_deferred_cache else None
         effective_deferred_cache = effective_deferred_cache and deferred_warmup_sigma is not None
+        effective_normalize_weights = bool(normalize_weights) and not has_explicit_weights
 
         base_prompts = _current_base_prompts(p, kwargs)
         individuals, individual_masks = _encode_artist_conditionings(p.sd_model, artists, base_prompts)
-        user_weights = [1.0] * len(individuals)
+        user_weights = list(parsed_weights)
         merge_summary = ""
 
         if effective_merge_similar:
@@ -1846,6 +2318,7 @@ class Script(scripts.Script):
                 artists,
                 individuals,
                 individual_masks,
+                user_weights,
                 merge_threshold,
             )
 
@@ -1856,9 +2329,9 @@ class Script(scripts.Script):
             user_weights,
             combine_mode,
             fusion_mode,
-            float(strength),
+            strength,
             bool(apply_to_uncond),
-            bool(normalize_weights),
+            effective_normalize_weights,
             int(start_block),
             int(end_block),
             start_percent,
@@ -1866,18 +2339,23 @@ class Script(scripts.Script):
             str(layer_filter or ""),
             effective_deferred_cache,
             deferred_warmup_sigma,
+            lowrank_k,
+            artist_ema_alpha,
+            effective_static_capture,
+            static_capture_k,
+            has_explicit_weights,
         )
         p.sd_model.forge_objects.unet = patched_unet
 
         _record_generation_params(
             p,
-            artists,
+            artist_entries,
             len(individuals),
             combine_mode,
             fusion_mode,
-            float(strength),
+            strength,
             bool(apply_to_uncond),
-            bool(normalize_weights),
+            effective_normalize_weights,
             int(start_block),
             int(end_block),
             start_percent,
@@ -1888,4 +2366,9 @@ class Script(scripts.Script):
             effective_merge_similar,
             merge_threshold,
             merge_summary,
+            lowrank_k,
+            artist_ema_alpha,
+            effective_static_capture,
+            static_capture_k,
+            has_explicit_weights,
         )

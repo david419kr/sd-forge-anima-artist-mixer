@@ -47,7 +47,26 @@ Weighted example:
 (@artist_name:1.2), (@another_artist:0.8)
 ```
 
-Artist entries are separated by commas.
+Artist entries are separated by commas. A trailing comma is ignored.
+
+You can also use v24-style injection weights:
+
+```text
+::@artist_name::1.5, @another_artist::0.8
+```
+
+The two weight styles affect different parts of the result:
+
+- `(@artist_name:1.2)` changes the text encoder emphasis.
+- `::@artist_name::1.5` changes the artist cross-attention injection weight.
+
+The forms can be combined:
+
+```text
+::(@artist_name:1.2)::1.5
+```
+
+Injection weights are clamped to `0.0` through `4.0`. If any artist entry uses an explicit `::weight`, **Normalize Weights** is bypassed for that generation.
 
 <img width="799" height="311" alt="image" src="https://github.com/user-attachments/assets/ee3cf6e8-84d1-458c-89d8-1e3f7c5ec452" />
 
@@ -98,6 +117,45 @@ Good general-purpose mode for mixing multiple artists when not using Forge Coupl
 
 Combines artist conditionings in one context. This is usually the better choice when using Forge Couple.
 
+### lowrank_avg
+
+Experimental v24 mode that averages artist influence through a low-rank approximation. Use **Lowrank K** in Advanced to control the rank.
+
+## Fusion Modes
+
+### interpolate
+
+Default mode. Blends from the base prompt output toward the artist output.
+
+### concat_with_base
+
+Keeps the base prompt context together with the artist context. This can be useful when the artist effect is too detached from the main prompt.
+
+### base_preserve
+
+Injects artist influence while trying to preserve the base prompt direction. This is useful when style strength should increase without pulling the image too far away from the main prompt.
+
+## Strength
+
+**Strength** supports `0.0` through `4.0`.
+
+- `0.0`: no artist influence
+- `1.0`: normal artist influence
+- Above `1.0`: extrapolated stronger artist influence
+
+High values can strongly change composition or image quality.
+
+## Advanced Options
+
+- **Lowrank K**: rank used by `lowrank_avg`. If it is greater than or equal to the artist count, the extension falls back to normal `output_avg` behavior.
+- **Artist EMA Alpha**: smooths artist influence across sampling steps. Higher values are more stable but can reduce responsiveness.
+- **Artist Static Capture**: captures the first few unique sampling steps and then reuses the averaged artist influence. It is used with `output_avg` and `lowrank_avg`.
+- **Static Capture K**: number of unique sampling steps used by Artist Static Capture.
+- **Experimental: Deferred Cache**: local speed/quality tradeoff for `output_avg`.
+- **Experimental: Merge Similar Artists**: merges very similar artist conditionings. This can change the result noticeably.
+
+If both **Artist Static Capture** and **Experimental: Deferred Cache** are enabled, Artist Static Capture takes priority.
+
 ## Forge Couple Notes
 
 When using Forge Couple together with Anima Artist Mixer, use:
@@ -107,6 +165,8 @@ Combine Mode: concat
 ```
 
 `output_avg` may make the artist effect very weak with Forge Couple because Forge Couple's regional prompts remain dominant.
+
+Cache-based stabilizers are automatically disabled when Forge Couple is detected.
 
 ## LoRA Notes
 
