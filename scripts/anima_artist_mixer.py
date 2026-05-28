@@ -2199,13 +2199,13 @@ class Script(scripts.Script):
                         label="Artist EMA Alpha",
                     )
                 with gr.Row():
-                    artist_static_capture = gr.Checkbox(value=False, label="Artist Static Capture")
+                    artist_static_capture = gr.Checkbox(value=False, label="Experimental: Artist Static Capture")
                     static_capture_k = gr.Slider(
                         minimum=1,
                         maximum=STATIC_CAPTURE_K_MAX,
                         value=STATIC_CAPTURE_K_DEFAULT,
                         step=1,
-                        label="Static Capture K",
+                        label="Experimental: Static Capture K",
                     )
                 with gr.Row():
                     deferred_cache = gr.Checkbox(value=False, label="Experimental: Deferred Cache")

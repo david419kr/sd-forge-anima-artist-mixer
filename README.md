@@ -149,12 +149,12 @@ High values can strongly change composition or image quality.
 
 - **Lowrank K**: rank used by `lowrank_avg`. If it is greater than or equal to the artist count, the extension falls back to normal `output_avg` behavior.
 - **Artist EMA Alpha**: smooths artist influence across sampling steps. Higher values are more stable but can reduce responsiveness.
-- **Artist Static Capture**: captures the first few unique sampling steps and then reuses the averaged artist influence. It is used with `output_avg` and `lowrank_avg`.
-- **Static Capture K**: number of unique sampling steps used by Artist Static Capture.
+- **Experimental: Artist Static Capture**: captures the first few unique sampling steps and then reuses the averaged artist influence. It is used with `output_avg` and `lowrank_avg`.
+- **Experimental: Static Capture K**: number of unique sampling steps used by Artist Static Capture.
 - **Experimental: Deferred Cache**: local speed/quality tradeoff for `output_avg`.
 - **Experimental: Merge Similar Artists**: merges very similar artist conditionings. This can change the result noticeably.
 
-If both **Artist Static Capture** and **Experimental: Deferred Cache** are enabled, Artist Static Capture takes priority.
+If both **Experimental: Artist Static Capture** and **Experimental: Deferred Cache** are enabled, Artist Static Capture takes priority.
 
 ## Forge Couple Notes
 
