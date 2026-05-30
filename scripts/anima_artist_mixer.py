@@ -19,6 +19,7 @@ TITLE = "AnimaArtistCrossAttn"
 SECTION = ("anima_artist_mixer", "Anima Artist Mixer")
 
 OPT_POSITION = "aam_artist_chain_position"
+OPT_STRENGTH_IN_CFG_ROW = "aam_artist_strength_in_cfg_row"
 POSITION_ABOVE = "above"
 POSITION_BETWEEN = "between"
 POSITION_BELOW = "below"
@@ -56,6 +57,17 @@ def _register_settings() -> None:
         .info("Requires Reload UI.")
         .needs_reload_ui(),
     )
+    shared.opts.add_option(
+        OPT_STRENGTH_IN_CFG_ROW,
+        shared.OptionInfo(
+            False,
+            "Show Artist Strength in the CFG Scale row",
+            gr.Checkbox,
+            section=SECTION,
+        )
+        .info("Moves the Strength slider out of the AnimaArtistCrossAttn accordion. Requires Reload UI.")
+        .needs_reload_ui(),
+    )
 
 
 script_callbacks.on_ui_settings(_register_settings)
@@ -64,6 +76,33 @@ script_callbacks.on_ui_settings(_register_settings)
 def _artist_position() -> str:
     value = getattr(shared.opts, OPT_POSITION, POSITION_BETWEEN)
     return value if value in POSITION_CHOICES else POSITION_BETWEEN
+
+
+def _artist_strength_in_cfg_row() -> bool:
+    return bool(getattr(shared.opts, OPT_STRENGTH_IN_CFG_ROW, False))
+
+
+def _create_strength_slider(
+    id_part: str,
+    *,
+    label: str,
+    visible: bool = True,
+    elem_id: str | None = None,
+    scale: int | None = None,
+) -> gr.Slider:
+    kwargs: dict[str, Any] = {
+        "minimum": 0.0,
+        "maximum": 4.0,
+        "value": 1.0,
+        "step": 0.05,
+        "label": label,
+        "visible": visible,
+    }
+    if elem_id is not None:
+        kwargs["elem_id"] = elem_id
+    if scale is not None:
+        kwargs["scale"] = scale
+    return gr.Slider(**kwargs)
 
 
 def _toprow_artist_components() -> dict[str, gr.components.Component]:
@@ -2097,6 +2136,52 @@ def _record_generation_params(
         p.extra_generation_params["AnimaArtistCrossAttn Merge Summary"] = merge_summary
 
 
+class ScriptArtistStrengthTop(scripts.Script):
+    section = "cfg"
+    create_group = False
+    sorting_priority = -1000
+
+    def __init__(self):
+        self.strength: gr.Slider | None = None
+        self._registered_target: str | None = None
+
+    def title(self):
+        return "AnimaArtistCrossAttn Artist Strength"
+
+    def show(self, is_img2img):
+        if not _artist_strength_in_cfg_row():
+            return None
+
+        id_part = "img2img" if is_img2img else "txt2img"
+        target_elem_id = f"{id_part}_distilled_cfg_scale"
+        if self._registered_target != target_elem_id:
+            self.on_before_component(lambda _x: self._inject_strength_slider(id_part), elem_id=target_elem_id)
+            self._registered_target = target_elem_id
+
+        return scripts.AlwaysVisible
+
+    def _inject_strength_slider(self, id_part: str) -> None:
+        if self.strength is None:
+            self.strength = _create_strength_slider(
+                id_part,
+                label="Artist Strength",
+                elem_id=f"{id_part}_anima_artist_strength",
+                scale=4,
+            )
+
+    def ui(self, is_img2img):
+        id_part = "img2img" if is_img2img else "txt2img"
+        if self.strength is None:
+            self._inject_strength_slider(id_part)
+
+        self.infotext_fields = [(self.strength, "AnimaArtistCrossAttn Strength")]
+        self.paste_field_names = ["AnimaArtistCrossAttn Strength"]
+        return [self.strength]
+
+    def process_before_every_sampling(self, p, strength: float, **kwargs) -> None:
+        p._aam_artist_strength = _clamp_strength(strength)
+
+
 class Script(scripts.Script):
     sorting_priority = 18138
 
@@ -2108,6 +2193,7 @@ class Script(scripts.Script):
 
     def ui(self, is_img2img):
         id_part = "img2img" if is_img2img else "txt2img"
+        strength_in_cfg_row = _artist_strength_in_cfg_row()
         artist_chain = _artist_chain_component(id_part)
         if artist_chain is None:
             logger.warning(
@@ -2133,13 +2219,16 @@ class Script(scripts.Script):
                     value=FUSION_INTERPOLATE,
                     label="Fusion Mode",
                 )
-                strength = gr.Slider(
-                    minimum=0.0,
-                    maximum=4.0,
-                    value=1.0,
-                    step=0.05,
-                    label="Strength",
-                )
+                if strength_in_cfg_row:
+                    strength = gr.Number(
+                        value=1.0,
+                        label="Strength",
+                        visible=False,
+                        elem_id=f"{id_part}_anima_artist_strength_hidden",
+                    )
+                    strength.do_not_save_to_config = True
+                else:
+                    strength = _create_strength_slider(id_part, label="Strength")
 
             with gr.Row():
                 apply_to_uncond = gr.Checkbox(value=False, label="Apply to Uncond")
@@ -2228,7 +2317,6 @@ class Script(scripts.Script):
 
         self.infotext_fields = [
             (artist_chain, "Anima Artist Chain"),
-            (strength, "AnimaArtistCrossAttn Strength"),
             (combine_mode, "AnimaArtistCrossAttn Combine"),
             (fusion_mode, "AnimaArtistCrossAttn Fusion"),
             (apply_to_uncond, "AnimaArtistCrossAttn Apply Uncond"),
@@ -2247,6 +2335,8 @@ class Script(scripts.Script):
             (artist_static_capture, "AnimaArtistCrossAttn Artist Static Capture"),
             (static_capture_k, "AnimaArtistCrossAttn Static Capture K"),
         ]
+        if not strength_in_cfg_row:
+            self.infotext_fields.insert(1, (strength, "AnimaArtistCrossAttn Strength"))
         self.paste_field_names = [name for _, name in self.infotext_fields]
 
         return [
@@ -2318,6 +2408,8 @@ class Script(scripts.Script):
         if fusion_mode not in FUSION_CHOICES:
             fusion_mode = FUSION_INTERPOLATE
 
+        if _artist_strength_in_cfg_row():
+            strength = getattr(p, "_aam_artist_strength", strength)
         strength = _clamp_strength(strength)
         start_percent = _clamp01(start_percent)
         end_percent = _clamp01(end_percent)

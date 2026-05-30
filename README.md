@@ -89,6 +89,18 @@ Available positions:
 
 Changing this setting requires reloading the UI.
 
+## Artist Strength Position
+
+By default, **Strength** stays inside the **AnimaArtistCrossAttn** panel.
+
+You can move it to the CFG Scale row with:
+
+```text
+Settings > Anima Artist Mixer > Show Artist Strength in the CFG Scale row
+```
+
+Changing this setting requires reloading the UI.
+
 ## AnimaArtistCrossAttn Panel
 
 The **AnimaArtistCrossAttn** panel contains optional controls.
